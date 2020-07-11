@@ -18,6 +18,8 @@ NUM_ANGLES = int(360 // ANGLE_STEP)
 anchors_per_level = 9
 grid_size_multiplier = 4
 
+def cvt2cpu(gpu_tensor):
+    return torch.FloatTensor(gpu_tensor.size()).copy_(gpu_tensor)
 
 class ChannelSELayer(nn.Module):
     """
@@ -93,45 +95,34 @@ class Conv2D_BN_Leaky(nn.Module):
         self.in_c = in_c
         self.out_c = out_c
         self.kernel_size = kernel_size
-
-    def forward(self, x):
         if isinstance(self.kernel_size, int):
             padding = (self.kernel_size - 1) // 2
         elif isinstance(self.kernel_size, tuple):
             padding = (self.kernel_size[0] - 1) // 2
-        Conv2D = nn.Conv2d(self.in_c, self.out_c, self.kernel_size, stride=1, padding=padding, bias=False)
-        BN = nn.BatchNorm2d(self.out_c)
-        Leaky = nn.LeakyReLU(0.1, inplace=True)
-        x = Conv2D(x)
-        x = BN(x)
-        x = Leaky(x)
+        self.Conv2D = nn.Conv2d(self.in_c, self.out_c, self.kernel_size, stride=1, padding=padding, bias=False)
+        self.BN = nn.BatchNorm2d(self.out_c)
+        self.Leaky = nn.LeakyReLU(0.1, inplace=True)
+
+    def forward(self, x):
+        x = self.Conv2D(x)
+        x = self.BN(x)
+        x = self.Leaky(x)
         return x
 
 
-class Darknet(nn.Module):
+class yolo_body(nn.Module):
 
-    def __init__(self, cfgfile='./yolo_v3.cfg'):
-        super(Darknet, self).__init__()
-        self.blocks = parse_cfg(cfgfile)
-        # print(len(self.blocks))
-        self.models = self.create_modules(self.blocks)
-        # print(self.modules)
-
-    def get_yolo_layers(self):
-        yolo_layers = {}
-        for module in self.models:
-            if isinstance(module[0], YoloLayer):
-                yolo_layers[module[0].name] = module[0]
-        return yolo_layers
-
-    def yolo_body(self, yolo_layers, num_anchors=9, num_classes=13):
+    def __init__(self, num_anchors=9, num_classes=13):
+        super(yolo_body, self).__init__()
         """Create Poly-YOLo model CNN body in Pytorch."""
+        self.num_anchors = num_anchors
+        self.num_classes = num_classes
+
+    def forward(self, yolo_layers):
         tiny = yolo_layers['tiny']
         small = yolo_layers['small']
         medium = yolo_layers['medium']
         big = yolo_layers['big']
-
-
         base = 6
         tiny = Conv2D_BN_Leaky(tiny.shape[1], base*32, (1, 1))(tiny)
         small = Conv2D_BN_Leaky(small.shape[1], base*32, (1, 1))(small)
@@ -148,10 +139,78 @@ class Darknet(nn.Module):
         all = Conv2D_BN_Leaky(all.shape[1], num_filters * 2, (3, 3))(all)
         all = Conv2D_BN_Leaky(all.shape[1], num_filters, (1, 1))(all)
         all = Conv2D_BN_Leaky(all.shape[1], num_filters*2, (3, 3))(all)
-        all = nn.Conv2d(all.shape[1], num_anchors * (num_classes + 5 + NUM_ANGLES3), (1, 1))(all)
+        all = nn.Conv2d(all.shape[1], self.num_anchors * (self.num_classes + 5 + NUM_ANGLES3), (1, 1))(all)
 
         return all
         # print(tiny.shape, small.shape, medium.shape, big.shape)
+
+
+class yolo_body(nn.Module):
+
+    def __init__(self, in_dim, num_anchors=9, num_classes=1):
+        super(yolo_body, self).__init__()
+        """Create Poly-YOLo model CNN body in Pytorch."""
+        self.num_anchors = num_anchors
+        self.num_classes = num_classes
+        self.in_dim = in_dim
+        self.base = 6
+        self.CBL_tiny = Conv2D_BN_Leaky(in_dim[0], self.base * 32, (1, 1))
+        self.CBL_small = Conv2D_BN_Leaky(in_dim[1], self.base * 32, (1, 1))
+        self.CBL_medium = Conv2D_BN_Leaky(in_dim[2], self.base * 32, (1, 1))
+        self.CBL_big = Conv2D_BN_Leaky(in_dim[3], self.base * 32, (1, 1))
+        num_filters = self.base * 32
+
+        self.all1 = Conv2D_BN_Leaky(self.base * 32, num_filters, (1, 1))
+        self.all2 = Conv2D_BN_Leaky(num_filters, num_filters * 2, (3, 3))
+        self.all3 = Conv2D_BN_Leaky(num_filters * 2, num_filters, (1, 1))
+        self.all4 = Conv2D_BN_Leaky(num_filters, num_filters * 2, (3, 3))
+        self.all5 = nn.Conv2d(num_filters * 2, self.num_anchors * (self.num_classes + 5 + NUM_ANGLES3), (1, 1))
+
+    def forward(self, yolo_layers):
+        tiny = yolo_layers['tiny']
+        small = yolo_layers['small']
+        medium = yolo_layers['medium']
+        big = yolo_layers['big']
+        tiny = self.CBL_tiny(tiny)
+        small = self.CBL_small(small)
+        medium = self.CBL_medium(medium)
+        big = self.CBL_big(big)
+
+        up = UpSample(scale_factor=2, mode='bilinear')
+        all = medium + up(big)
+        all = small + up(all)
+        all = tiny + up(all)
+
+        all = self.all1(all)
+        all = self.all2(all)
+        all = self.all3(all)
+        all = self.all4(all)
+        all = self.all5(all)
+
+        return all
+        # print(tiny.shape, small.shape, medium.shape, big.shape)
+
+
+class Darknet(nn.Module):
+
+    def __init__(self, device='cpu', cfgfile='./yolo_v3.cfg'):
+        super(Darknet, self).__init__()
+        self.blocks = parse_cfg(cfgfile)
+        # print(len(self.blocks))
+        self.device = device
+        self.models = self.create_modules(self.blocks)
+        self.num_classes = 1
+        self.num_anchors = 9
+        # print(self.modules)
+
+    def get_yolo_layers(self):
+        yolo_layers = {}
+        for module in self.models:
+            if isinstance(module[0], YoloLayer):
+                yolo_layers[module[0].name] = module[0]
+        return yolo_layers
+
+
 
     def darknet_body(self, x):
         yolo_layers = {}
@@ -171,14 +230,17 @@ class Darknet(nn.Module):
                 output[index] = x
                 name = block['name']
                 yolo_layers[name] = x
+            elif block['type'] == 'yolo_body':
+                self.models[index] = yolo_body([yolo_layers['tiny'].shape[1], yolo_layers['small'].shape[1], yolo_layers['medium'].shape[1], yolo_layers['big'].shape[1]]).to(self.device)
+                x = self.models[index](yolo_layers)
 
             else:
                 print("Unknown type {0}".format(block['type']))
-        return yolo_layers
+
+        return x
 
     def forward(self, x):
-        yolo_layers = self.darknet_body(x)
-        x = self.yolo_body(yolo_layers, num_classes=1)
+        x = self.darknet_body(x)
         return x
 
     def create_modules(self, blocks):
@@ -229,6 +291,8 @@ class Darknet(nn.Module):
             elif block['type'] == 'yolo':
                 name = block['name']
                 module.add_module('feature_{0}'.format(index), YoloLayer(name))
+            elif block['type'] == 'yolo_body':
+                module.add_module('yolo_body_{}'.format(index), EmptyLayer())
 
             models.append(module)
             prev_filters = filters
@@ -277,22 +341,21 @@ def box_iou(b1, b2):
     return iou
 
 
-def yolo_head(feats, anchors, num_classes, input_shape, calc_loss=False):
+def yolo_head(device, feats, anchors, num_classes, input_shape, calc_loss=False):
     """Convert final layer features to bounding box parameters.
     feats: nB, nC, nH, nW
     """
-
     nA = anchors_per_level
     nB, nC, nH, nW = feats.shape
-    anchors = anchors.view([1, 1, 1, nA, 2])
+    anchors = anchors.view([1, 1, 1, nA, 2]).to(device)
     grid_y = torch.linspace(0, nH-1, nH).view(-1, 1, 1, 1).repeat([1, nW, 1, 1])
     grid_x = torch.linspace(0, nW-1, nW).view(1, -1, 1, 1).repeat([nH, 1, 1, 1])
-    grid = torch.cat([grid_x, grid_y], dim=-1)
+    grid = torch.cat([grid_x, grid_y], dim=-1).to(device)
     feats = feats.view([-1, nH, nW, nA, num_classes + 5 + NUM_ANGLES3])
     ix = torch.LongTensor(range(5))
 
-    box_xy = (feats[:, :, :, :, :2].sigmoid() + grid) / torch.tensor([nW, nH])
-    box_wh = (feats[:, :, :, :, 2:4].exp() * anchors) / torch.tensor([input_shape[1], input_shape[0]])
+    box_xy = (feats[:, :, :, :, :2].sigmoid() + grid) / torch.tensor([nW, nH]).to(device)
+    box_wh = (feats[:, :, :, :, 2:4].exp() * anchors) / torch.tensor([input_shape[1], input_shape[0]]).to(device)
     box_confidence = feats[:, :, :, :, 4:5].sigmoid()
     box_class_probs = feats[:, :, :, :,  5:5 + num_classes]
     polygons_confidence = feats[:, :, :, :, 5 + num_classes + 2:5 + num_classes + NUM_ANGLES3:3].sigmoid()
@@ -314,7 +377,7 @@ def yolo_head(feats, anchors, num_classes, input_shape, calc_loss=False):
     return box_xy, box_wh, box_confidence, box_class_probs, polygons_x, polygons_y, polygons_confidence
 
 
-def yolo_loss(yolo_outputs, y_true, anchors, num_classes, ignore_thresh=.5):
+def yolo_loss(device, yolo_outputs, y_true, anchors, num_classes, ignore_thresh=.5):
     """Return yolo_loss tensor
 
     Parameters
@@ -330,25 +393,25 @@ def yolo_loss(yolo_outputs, y_true, anchors, num_classes, ignore_thresh=.5):
     loss: tensor, shape=(1,)
 
     """
-    anchors = torch.from_numpy(anchors).float()
+    anchors = torch.from_numpy(anchors).float().to(device)
     g_y_true = y_true
     input_shape = np.array(yolo_outputs.shape[2:]) * grid_size_multiplier
 
     grid_shapes = np.array(y_true.shape[1:3])
     # batch size
     nB = yolo_outputs.shape[0]
-    ix = torch.LongTensor(range(5+num_classes+NUM_ANGLES3))
+    ix = torch.LongTensor(range(5+num_classes+NUM_ANGLES3)).to(device)
     object_mask = y_true.index_select(4, ix[4:5])   # confidence
     vertices_mask = y_true.index_select(4, ix[5 + num_classes + 2:5 + num_classes + NUM_ANGLES3:3])
     true_class_probs = y_true.index_select(4, ix[5:5 + num_classes])
-    yolo_head(yolo_outputs, anchors, num_classes, input_shape, calc_loss=True)
 
-    grid, raw_pred, pred_xy, pred_wh, pol_cnf = yolo_head(yolo_outputs, anchors, num_classes, input_shape, calc_loss=True)
+    grid, raw_pred, pred_xy, pred_wh, pol_cnf = yolo_head(device, yolo_outputs, anchors, num_classes, input_shape, calc_loss=True)
     pred_box = torch.cat([pred_xy.float(), pred_wh.float()], -1)
-    raw_true_xy = y_true[:, :, :, :, :2] * grid_shapes[::-1] - grid
+    grid = grid.to(device)
+    raw_true_xy = y_true[:, :, :, :, :2] * torch.Tensor([grid_shapes[1], grid_shapes[0]]).to(device) - grid
     raw_true_polygon0 = y_true[:, :, :, :, 5 + num_classes: 5 + num_classes + NUM_ANGLES3]
-
-    raw_true_wh = torch.log(y_true[..., 2:4] / anchors * input_shape[::-1]).float()
+    reverse_input_shape = torch.from_numpy(input_shape[::-1].copy()).to(device)
+    raw_true_wh = torch.log(y_true[..., 2:4] / anchors * reverse_input_shape).float()
     raw_true_wh[raw_true_wh==-float('inf')] = 0
     # raw_true_wh = K.switch(object_mask, raw_true_wh, K.zeros_like(raw_true_wh))  # avoid log(0)=-inf
 
@@ -371,6 +434,8 @@ def yolo_loss(yolo_outputs, y_true, anchors, num_classes, ignore_thresh=.5):
     # Find ignore mask, iterate over each of batch.
     ignore_mask = []
     object_mask_bool = object_mask.bool()
+    pred_box = cvt2cpu(pred_box)
+    y_true = cvt2cpu(y_true).detach()
     for b in range(nB):
         true_box = y_true[b, ..., 0:4][object_mask_bool[b, ..., 0]]
         iou = box_iou(pred_box[b], true_box)    # H,W, nA, num_gt
@@ -411,11 +476,13 @@ def yolo_loss(yolo_outputs, y_true, anchors, num_classes, ignore_thresh=.5):
 
 
 def main():
-    model = Darknet()
+    device = 'cuda' if torch.cuda.is_available() else "cpu"
+    model = Darknet(device)
     # x = torch.randn(4, 3, 416, 832)
     # res = model(x)
     # print(res.shape)
 
+    device = 'cuda' if torch.cuda.is_available() else "cpu"
     annotation_path = './data/simulator_dataset/simulator-train.txt'
     validation_path = './data/simulator_dataset/simulator-val.txt'
     log_dir = 'models/'
@@ -455,17 +522,26 @@ def main():
     val_dataset = MyDataset(lines_val, input_shape, anchors, num_classes, False)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
+    model = model.to(device)
     epochs = 10
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adadelta(model.parameters(), lr=1.0)
     for epoch in range(epochs):
         running_loss = 0.0
         for i, (image, labels) in enumerate(train_loader):
+            image = image.to(device)
+            labels = labels.to(device)
+
             optimizer.zero_grad()
             yolo_outputs = model(image)
-            loss = yolo_loss(yolo_outputs, labels, anchors, num_classes, ignore_thresh=0.5)
+            loss = yolo_loss(device, yolo_outputs, labels, anchors, num_classes, ignore_thresh=0.5)
             loss.backward()
+            grad_val = 0.0
+            for name, parms in model.named_parameters():
+                #print('-->name:', name, '-->grad_requirs:', parms.requires_grad, '--weight', torch.mean(parms.data),
+                #      ' -->grad_value:', torch.mean(parms.grad))
+                grad_val += torch.mean(parms.grad).item()
+            print(grad_val)
             optimizer.step()
-
             running_loss += loss.item()
             if i % 100 == 99:
                 print("epoch_{},iter_{}, loss_{}".format(epoch, i, running_loss / 100))
